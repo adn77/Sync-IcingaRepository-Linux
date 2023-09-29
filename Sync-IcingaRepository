@@ -1,0 +1,171 @@
+#!/bin/bash
+#
+# Icinga custom repository synchronisation for Linux
+#
+#  Argument list matches powershell command
+#  except for the "-Latest" option which downloads only
+#  most recent packages in order to keep the local repo
+#  small and reduce download traffic
+#
+#   Sync-IcingaRepository
+#    -Name 'Icinga Stable Local'
+#    -Path './var/www'
+#    -RemotePath 'https://monitoring.example.org/repo'
+#    -Source 'https://packages.icinga.com/IcingaForWindows/stable/ifw.repo.json';
+#   [-Latest] 
+#
+# required dependencies:
+#  curl, jq
+
+trap "exit 1" TERM
+export MYPID=$$
+
+TMP="/tmp/"
+JQ="/usr/bin/jq -r"
+
+REPONAME=""
+LOCALSOURCE=""
+REMOTESOURCE=""
+SOURCEREPO=""
+REPOJSON=""
+FULL="true"
+
+usage()
+{
+    echo "Sync-IcingaRepository \\"
+    echo "  -Name 'Icinga Stable Local' \\"
+    echo "  -Path '/var/www' \\"
+    echo "  -RemotePath 'https://monitoring.example.org/repo' \\"
+    echo "  -Source 'https://packages.icinga.com/IcingaForWindows/stable/ifw.repo.json' \\"
+    echo " [-Latest]"
+    kill -s TERM $MYPID
+}
+
+check_arg()
+{
+    if [ "${2#-}" != "${2}" -o -z "$2" ] ; then
+        echo "ERROR: missing argument for ${1}"
+        usage
+    fi
+}
+
+while [ "$#" -gt 0 ] ; do
+    case "$1" in
+            -Name|-name|--Name|--name|-n)
+                check_arg $1 $2
+                REPONAME=$2
+                shift
+                ;;
+            -Path|-path|--Path|--path|-p)
+                check_arg $1 $2
+                LOCALSOURCE=$2
+                shift
+                ;;
+            -RemotePath|-remotepath|--RemotePath|--remotepath|-r)
+                check_arg $1 $2
+                REMOTESOURCE=$2
+                shift
+                ;;
+            -Source|-source|--Source|--source|-s)
+                check_arg $1 $2
+                SOURCEREPO=${2%/*}
+                REPOJSON=${2##*/}
+                shift
+                ;;
+            -Latest|-latest|--Latest|--latest|-l)
+                FULL=""
+                ;;
+            *)
+                echo "ERROR: unknown option ${1}"
+                usage
+                ;;
+        esac
+        shift
+done
+
+if [ -z "${REPONAME}" -o -z "${LOCALSOURCE}" -o -z "${REMOTESOURCE}" -o -z "${SOURCEREPO}" -o -z "${REPOJSON}" ] ; then
+    echo "ERROR: missing argument(s)"
+    usage
+fi
+
+# download current repo JSON to temp location
+REMOTEREPOFILE="$(mktemp ${TMP}/icinga_repo.XXXXXXXXX)" || exit 1
+curl -s "${SOURCEREPO}/${REPOJSON}" -o "${REMOTEREPOFILE}"
+
+# check if remote repo file is more recent than local repo file
+LOCALREPOFILE="${LOCALSOURCE}/${REPOJSON}"
+if [ -f "${LOCALREPOFILE}" ] ; then
+    LOCALREPODATE=$(${JQ} '.Info.Updated' "${LOCALREPOFILE}" | awk -F' |/' '{printf "%s-%s-%s %s",$1,$2,$3,$4}')
+    REMOTEREPODATE=$(${JQ} '.Info.Updated' "${REMOTEREPOFILE}" | awk -F' |/' '{printf "%s-%s-%s %s",$1,$2,$3,$4}')
+    if [ $(date -d "${LOCALREPODATE}" +%s) -lt $(date -d "${REMOTEREPODATE}" +%s) ] ; then
+        echo "repo needs updating"
+    else
+        echo "repo didn't change"
+        rm -f "${REMOTEREPOFILE}"
+        exit 0
+    fi
+else
+    echo "repo needs creating"
+fi
+
+# create target directory if it doesn't exist
+if ! [ -d "${LOCALSOURCE}" ] ; then
+    mkdir -p "${LOCALSOURCE}"
+fi
+
+CURRENTDATE=$(date +"%Y/%m/%d %H:%M:%S")
+
+if [ -n "${FULL}" ] ; then
+    # if script is runs without "-Latest" argument then do a complete repo sync
+    ${JQ} --arg Name "${REPONAME}" --arg LocalSource "${LOCALSOURCE}" --arg RemoteSource "${REMOTESOURCE}" --arg Created "${CURRENTDATE}" --arg Updated "${CURRENTDATE}" \
+        '{ "Info": (.Info | .Name=$Name | .LocalSource=$LocalSource | .RemoteSource=$RemoteSource | .Created=$Created | .Updated=$Updated), "Packages": (.Packages) }' \
+        "${REMOTEREPOFILE}" > "${LOCALREPOFILE}"
+else
+    # otherwise only download the highest version of each package
+    ${JQ} --arg Name "${REPONAME}" --arg LocalSource "${LOCALSOURCE}" --arg RemoteSource "${REMOTESOURCE}" --arg Created "${CURRENTDATE}" --arg Updated "${CURRENTDATE}" \
+        '{ "Info": (.Info | .Name=$Name | .LocalSource=$LocalSource | .RemoteSource=$RemoteSource | .Created=$Created | .Updated=$Updated), "Packages": (.Packages | to_entries | map({ (.key): .value | group_by(.key, .Architecture) | map(sort_by(.Version | split(".") | map(tonumber))[-1]) }) | add ) }' \
+        "${REMOTEREPOFILE}" > "${LOCALREPOFILE}"
+fi
+rm -f "${REMOTEREPOFILE}"
+
+# keep track of all files belonging to the repository
+FILELIST="${LOCALREPOFILE}"
+
+# check if new files need to be downloaded
+for REPOFILE in $(${JQ} '.Packages[] | .[] | "\(.Hash)#\(.Location)"' "${LOCALREPOFILE}") ; do
+    FILE=${REPOFILE#*#}
+    FILE=${FILE//\\/\/}
+    HASH=${REPOFILE%#*}
+
+    FILELIST="${FILELIST} ${LOCALSOURCE}/${FILE}"
+
+    # if file exists
+    if [ -f "${LOCALSOURCE}/${FILE}" ] ; then
+        # compare repo file hash with sha256sum of already downloaded file
+        if [ $(sha256sum "${LOCALSOURCE}/${FILE}" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]') = "${HASH}" ] ; then
+            echo "${FILE} didn't change"
+            continue
+        else
+            echo "${FILE} changed"
+        fi
+    else
+            echo "${FILE} dosn't exist"
+    fi
+
+    # create package directories if necessary
+    SUBDIR=${FILE%/*}
+    if ! [ -d "${LOCALSOURCE}/${SUBDIR}" ] ; then
+        mkdir -p "${LOCALSOURCE}/${SUBDIR}"
+    fi
+
+    # download package file
+    curl -s "${SOURCEREPO}/${FILE}" -o "${LOCALSOURCE}/${FILE}" 
+done
+
+# cleanup files that are not referenced by repo json
+for DELFILE in $(find ${LOCALSOURCE} -type f) ; do
+    if [[ $FILELIST != *"${DELFILE}"* ]] ; then
+        echo "deleting unreferenced ${DELFILE}"
+        rm -f "${DELFILE}"
+    fi
+done
