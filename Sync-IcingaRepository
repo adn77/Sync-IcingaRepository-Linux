@@ -97,7 +97,7 @@ LOCALREPOFILE="${LOCALSOURCE}/${REPOJSON}"
 if [ -f "${LOCALREPOFILE}" ] ; then
     LOCALREPODATE=$(${JQ} '.Info.Updated' "${LOCALREPOFILE}" | awk -F' |/' '{printf "%s-%s-%s %s",$1,$2,$3,$4}')
     REMOTEREPODATE=$(${JQ} '.Info.Updated' "${REMOTEREPOFILE}" | awk -F' |/' '{printf "%s-%s-%s %s",$1,$2,$3,$4}')
-    if [ $(date -d "${LOCALREPODATE}" +%s) -lt $(date -d "${REMOTEREPODATE}" +%s) ] ; then
+    if [ $(date -d "${LOCALREPODATE}" +%s) -lt $(date -d "${REMOTEREPODATE}" +%s) ] || [ -z "${LOCALREPODATE}" ] ; then
         echo "repo needs updating"
     else
         echo "repo didn't change"
